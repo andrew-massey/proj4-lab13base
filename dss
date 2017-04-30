@@ -1,0 +1,607 @@
+#include "Lab13.h"
+
+/*
+ * Main program entry.
+ */
+int main()
+{
+  setvbuf(stdout, NULL, _IONBF, BUFSIZ); //Set output to unbuffered
+  int exitChecker;
+
+  //Enter the shell loop
+  if ((exitChecker = shellLoop()) == -1)
+      printf("Unexpected termination.\n");
+  else
+    printf("Exiting 1730sh.\n");
+
+  return exitChecker;
+
+} //main
+
+/*
+ * The shell loop! Does nothing but loop until a proper exit.
+ */
+int shellLoop()
+{
+  int shellStatus = 1;
+  shell_terminal = STDIN_FILENO;
+
+  /*Ignore a bunch of signals*/
+  signal(SIGINT, SIG_IGN);
+  signal(SIGQUIT, SIG_IGN);
+  signal(SIGTSTP, SIG_IGN);
+  signal(SIGTTIN, SIG_IGN);
+  signal(SIGTTOU, SIG_IGN);
+  signal(SIGCHLD, SIG_IGN);
+
+  /* Put ourselves in our own process group.  */
+  shellPG = getpid();
+  if (setpgid (shellPG, shellPG) < 0)
+    {
+      perror ("Couldn't put the shell in its own process group");
+      exit(EXIT_FAILURE);
+    }
+  tcsetpgrp(shell_terminal, shellPG);
+  
+  //Loop until bad status
+  while (shellStatus >= 0)
+    {
+      std::string cmd;                //cmd input
+      
+      //Get current dir and fiddle with it for pretty ~ prompts
+      char * rawDirName = get_current_dir_name();
+      std::string homePath = getenv("HOME");
+      std::string currentDirName(rawDirName);
+      if (!strncmp(currentDirName.c_str(), homePath.c_str(), homePath.size()))
+	{ //We're in a sub directory of home, ~ it up
+	  std::string truncDirName = currentDirName.substr(homePath.size(),std::string::npos);
+	  printf("1730sh:~%s$ ", truncDirName.c_str());
+	}
+      else //We're not in a subdirectory of home, don't ~
+	printf("1730sh:%s$ ", currentDirName.c_str()); //shell prompt
+      free(rawDirName);
+
+      std::getline(std::cin, cmd);    //Get input
+      if (std::cin.eof() == 1) //Break if the user ctrl+Ds
+	cmd = "exit";
+
+      jobArg = cmd;
+
+      if (cmd.length() > 0) //Only if an actual command input
+	{
+	  cmdParser(cmd); //Pass to the parsing function
+
+	  if (shl_argv.size() > 0) //If the argument list is valid
+	    {
+	      if (shl_argv[0].at(0) == "exit") //"Exit" input entered
+		{
+		  if (shl_argv[0].size() == 1) //No custom exit status
+		    return lastExitStatus;
+		  else //Custom exit status, use it
+		    {//But make sure it's valid first
+		      char * eCheck = (char *)shl_argv[0].at(1).c_str();
+		      long converter = strtol(shl_argv[0].at(1).c_str(), &eCheck, 10);
+		       
+		      if (*eCheck) //Not a valid number!
+			return lastExitStatus;
+		      else //Valid number
+			return converter;
+		    }
+		}
+	      else if (shl_argv[0].at(0) == "cd") //"cd" input entered
+		{ //No argument = go home
+		  if (shl_argv[0].size() == 1)
+		    chdir(homePath.c_str());
+		  else
+		    { //Argument = go there
+		      if (chdir(shl_argv[0].at(1).c_str()) == -1)
+			perror("-1730sh: cd");
+		    }
+		}
+	      else if (shl_argv[0].at(0) == "jobs")
+		{
+		  printJobs();
+		}
+	      else if (shl_argv[0].at(0) == "help") //"Help" input entered"
+		{
+		  if (shl_argv[0].size() == 1) //No argument, show all topics
+		    printf("Available help topics:\n%s\n%s\n%s\n", "cd", "help [topic]", "exit");
+		  else if (shl_argv[0].at(1) != "help" && shl_argv[0].at(1) != "cd" && shl_argv[0].at(1) != "exit") //Invalid help topic
+		    printf("Invalid help topic.\n");
+		  else if (shl_argv[0].at(1) == "help") //Help help
+		    printf("Get help for various commands supported by the shell.\n%s\n%s\n", "\nFormat: help [topic]\n", "Example: help help");
+		  else if (shl_argv[0].at(1) == "cd") //Help cd
+		    printf("Change the current working directory.\n%s\n%s\n","\nFormat: cd [PATH]\n", "Example: cd myDirectoryName");
+		  else if (shl_argv[0].at(1) == "exit") //Help exit
+		    printf("Exit the shell. You can exit with the status of the last exited job or a custom status.\n%s\n%s\n",
+			   "\nFormat: exit [OPTIONAL STATUS INTEGER]\n", "Example: exit 1");
+		}
+	      else //Not a builtin, must be a command
+		  commandRunner();
+	    } //Exiting arg size if
+	} //Exiting cmd size if
+      /*      
+      //If everything's cool, print the job parse output
+      if (shellStatus >= 0)          
+	outputPrinter();
+      */
+      //RESET EVERYTHING BACK TO DEFAULT
+      shl_stdin = "STDIN_FILENO";
+      shl_stdout = "STDOUT_FILENO";
+      shl_stderr = "STDERR_FILENO";
+      shl_processes = 0;
+      foregroundJob = true;
+      shl_argv.clear();
+      jobArg.clear();
+    }
+
+  return 0;
+}
+
+/*
+ * Parses the command input. Very ugly.
+ * @param cmd The string to be parsed character by character.
+ */
+void cmdParser(std::string cmd)
+{
+  enum parseTypes {
+    appendOut, truncateOut, redirectIn, errorAppend, errorTruncate, regular
+  };
+  parseTypes wordTypes = regular;
+  size_t pos = 0;
+  size_t startSub = 0;
+  bool inQuotes = false;
+  bool wordFinished = false;
+  bool reset = false; //Needed to break out of the loop for certain characters
+
+  //The array to temporarily store things
+  vector<std::string> cmdArgs;
+
+  //The big loop: continue until the string is finished
+  while (pos < cmd.length())
+    {
+      if (!wordFinished) //If the word isn't finished, go here
+      	{
+	  if (reset) //If we have reset to be here, clear the reset flag
+	    reset = false;
+
+	  //Not a quote, fast forward through spaces
+	  while (!inQuotes && isspace(cmd[pos]) && pos < cmd.length())
+	    {
+	      pos++;
+	      startSub++;
+	    }
+
+	  //We're entering a quote, enable special handling
+	  if (cmd[pos] == '"' && cmd[pos-1] != '\\')
+	    {
+	      inQuotes = true;
+	      pos++;
+	      startSub++;
+	    }
+
+	  //Loop through non-space characters not in quotes
+	  while (!inQuotes && !wordFinished && !isspace(cmd[pos]) && pos < cmd.length())
+	    {
+	      //If the start symbol is a special character, prepare to
+	      //handle it in a special way
+	      if (startSub == pos && ((cmd[pos] == '>') || (cmd[pos] == '<') || (cmd[pos] == 'e' && cmd[pos+1] == '>') ||cmd[pos] == '|'))
+	      	{
+		  if (cmd[pos] == '>') //Output handling
+		    {
+		      pos++;
+		      startSub++;	      
+		      if (cmd[pos] == '>') //>> = append
+			{
+			  pos++;
+			  startSub++;
+			  wordTypes = appendOut;
+			}
+		      else // > = truncate
+			wordTypes = truncateOut;
+		    }
+		  
+		  else if (cmd[pos] == '<')
+                    { // < = input redirect
+		      wordTypes = redirectIn;
+		      pos++;
+		      startSub++;
+                    }
+		  
+                  else if (cmd[pos] == 'e')
+                    { // e> = truncate
+                      pos+=2;
+                      startSub+=2;
+                      if (cmd[pos] == '>')
+                        {// e>> = append
+                          pos++;
+                          startSub++;
+			  wordTypes = errorAppend;
+			}
+		      else
+			wordTypes = errorTruncate;
+		    }		  
+		  
+		  else if (cmd[pos] == '|')
+                    { //Pipe = new process
+		      if (cmdArgs.size() > 0) //Don't break on empty vectors
+			{
+			  shl_argv.push_back(cmdArgs);
+			  cmdArgs.clear();
+			}
+		      pos++;
+		      startSub++;
+		      wordTypes = regular;
+		    }
+		  
+		  reset = true; //Break back to the beginning loop
+		  
+	      	} //EXITING STARTPOS == WEIRD SYMBOL IF STATEMENT
+	      else //IF ANYTHING ELSE - regular characters
+	      	{
+		  if (cmd[pos] == '"' && cmd[pos-1] != '\\')
+		    { //This is a quote in a normal word, so we get rid of it
+		      cmd.erase(pos,1);
+		      pos--;
+		      continue;
+		    }
+		  
+		  //This is a special character in the middle of a string, finish the word
+		  if ((cmd[pos] == '>') || (cmd[pos] == '<') || (cmd[pos] == 'e' && cmd[pos+1] == '>') || (cmd[pos] == '|'))
+		      wordFinished = true;
+		  
+		  //If the word's not finished yet, move forward
+		  if (!wordFinished)
+		    pos++;
+		  
+		}
+	      
+	      if (reset) //Reset = break out of this loop too
+		break;
+
+	    }//EXITING THE NON-QUOTE WHILE LOOP - HIT A SPACE OR END	  
+	 
+	  if (reset) //Reset = restart the main loop
+	    continue;
+	  
+	  //We're in a quotation, fast forward through the entire string
+	  while (inQuotes && !wordFinished && pos < cmd.length())
+	    {
+	      if (cmd[pos] == '"' && cmd[pos-1] != '\\')
+		{ //This is the end of the quote
+		  cmd.erase(pos,1); //Get rid of the quotation mark
+		  pos--;
+		  wordFinished = true;
+		  inQuotes = false;
+		}
+	      
+	      pos++;
+	    }
+
+	}//Exiting "if !WordFinished"	  
+      
+      wordFinished = true; //I mean we have to be done if we're here, right?
+
+      if (wordFinished) //Handle finished words
+	{
+	  std::string temp(cmd.substr(startSub, pos-startSub));
+	  
+	  //Removing the \ from escape sequence quotes
+	   for (uint i = 0; i < temp.length(); i++)
+	    {
+	      if (temp[i] == '\\' && temp[i+1] == '"')
+		temp.erase(i,1);
+	    }
+
+	   //If the string isn't empty, handle it! 
+	   if (temp.length() > 0)
+	     {
+	       switch (wordTypes)
+		 {
+		 case appendOut:
+		   {//Set append out
+		     shl_stdout = temp;
+		     shl_stdout += " (append)";
+		     break;
+		   }
+		 case truncateOut:
+		   {//Set truncate out
+		     shl_stdout = temp;
+		     shl_stdout += " (truncate)";
+		     break;
+		   }
+		 case redirectIn:
+		   {//Set input redirection
+		     shl_stdin = temp;
+		     break;
+		   }
+		 case errorTruncate:
+		   {//Set error truncate redirection
+		     shl_stderr = temp;
+		     shl_stderr += " (truncate)";
+		     break;
+		   }
+		 case errorAppend:
+		   {//Set error append redirection
+		     shl_stderr = temp;
+		     shl_stderr += " (append)";
+		     break;
+		   }
+		 default:
+		   {//Normal word, put it in the array
+		     cmdArgs.push_back(temp);
+		     break;
+		   }
+		 }
+	       wordTypes = regular;
+	     }
+	   
+	   //Reset our variables
+	   startSub = pos;
+	   inQuotes = wordFinished = false;
+	}  
+    }//Exiting entire while loop
+
+  //Push whatever is left to the thing
+  if (cmdArgs.size() > 0)
+      shl_argv.push_back(cmdArgs);
+
+  shl_processes = shl_argv.size();
+  cmdArgs.clear();
+}
+
+/*
+ * Prints our job info and process stuff.
+ */
+void outputPrinter()
+{
+  printf("\n");
+  printf("Job STDIN = %s\n", shl_stdin.c_str());
+  printf("Job STDOUT = %s\n", shl_stdout.c_str());
+  printf("Job STDERR = %s\n", shl_stderr.c_str());
+
+  printf("\n");
+
+  printf("%d pipe(s)\n", shl_processes > 0 ? shl_processes - 1 : 0);
+  printf("%d process(es)\n", shl_processes);
+
+  printf("\n");
+
+  for (unsigned int i = 0; i < shl_argv.size(); i++)
+    {
+      printf("Process %d argv:\n", i);
+      for (unsigned int j = 0; j < shl_argv[i].size(); j++)
+	{
+	  printf("%d: %s\n", j, shl_argv[i].at(j).c_str());
+	}
+      printf("\n");
+    }
+}
+/*
+ * Runs our programs
+ */
+void commandRunner()
+{
+  int pid;
+  pid_t pgid;
+
+  vector<array<int, 2>> pipes; //Our pipe arrays
+
+  //CYCLE THROUGH ARGUMENT ARRAYS
+  for (unsigned int i = 0; i < shl_argv.size(); ++i)
+    {
+      if (i != shl_argv.size() - 1) //Not the last command
+	{
+	  int pipefd [2]; //Make some pipes
+	  if (pipe(pipefd) == -1)
+	    {
+	      perror("-1730sh: pipe");
+	      exit(EXIT_FAILURE);
+	    } //if
+	  pipes.push_back({pipefd[0], pipefd[1]});
+	} // if
+      
+      //Start FORKING processes
+      if ((pid = fork()) == -1)
+	{
+	  perror("-1730sh: fork");
+	  exit(EXIT_FAILURE);
+	}
+      else if (pid == 0) //In the child process
+	{
+	  //Reset the ignores to default for child
+	  signal(SIGINT, SIG_DFL);
+	  signal(SIGQUIT, SIG_DFL);
+	  signal(SIGTSTP, SIG_DFL);
+	  signal(SIGTTIN, SIG_DFL);
+	  signal(SIGTTOU, SIG_DFL);
+	  signal(SIGCHLD, SIG_DFL);
+	  
+	  pid = getpid();
+	  if (!pgid)
+	    pgid = pid;
+	  setpgid(pid, pgid);
+	  
+	  if (i != 0)
+	    { //Not the first command
+	      if (dup2(pipes.at(i-1)[0], STDIN_FILENO) == -1)
+		{
+		  perror("-1730sh: dup2");
+		  exit(EXIT_FAILURE);
+		}
+	    }
+	  if (i != shl_argv.size() - 1)
+	    { //Not the last command
+	      if (dup2(pipes.at(i)[1], STDOUT_FILENO) == -1)
+		{
+		  perror("-1730sh: dup2");
+		  exit(EXIT_FAILURE);
+		}
+	    }
+
+	  //close all pipes created so far
+	  for (unsigned int i = 0; i < pipes.size(); ++i)
+	    close_pipe(pipes.at(i).data());
+	  //Finally, let's make a program!
+	  execProg(shl_argv.at(i));
+	
+	} // end if-child
+      else
+	{
+	  if (!pgid)
+	    pgid = pid;
+	  setpgid(pid, pgid);
+	}
+    } // end for all commands
+  
+  // close all pipes
+  for (unsigned int i = 0; i < pipes.size(); ++i)
+    close_pipe(pipes.at(i).data());
+
+  if (foregroundJob)
+    jobToForeground(pgid, false);
+  else
+    jobToBackground(pgid, false);
+
+}
+
+/*
+ * Converts a vector of strings into a vector of characters. Adds nullptr
+ * as the last element of the vector.
+ * @param stringVector The vector of strings to be converted.
+ * @return The new vector of characters.
+ */
+vector<char *> convertVector(vector<std::string> &stringVector)
+{
+  vector<char *> charVector;
+
+  for (unsigned int i = 0; i < stringVector.size(); ++i)
+    {
+      charVector.push_back(new char [stringVector.at(i).size() + 1]);
+      strcpy(charVector.at(i), stringVector.at(i).c_str());
+    }
+  charVector.push_back(nullptr);
+  
+  return charVector;
+}
+
+/*
+ * Deletes our dynamically allocated character array from conversion.
+ * @param charVector Vector to be deleted.
+ */
+void deleteVector(vector<char *> & charVector)
+{
+  for (unsigned int i = 0; i < charVector.size(); ++i)
+      delete[] charVector.at(i);
+}
+
+/*
+ * Executes the program with an argument list of strings. Sends the
+ * strings to be converted to characters as appropriate first.
+ * @param stringArgs Vector of strings to be passed to program.
+ */
+void execProg(vector<std::string> stringArgs)
+{
+  vector<char *> charArgs = convertVector(stringArgs);
+  execvp(charArgs.at(0), &charArgs.at(0));
+  perror("-1730sh: "); //This only occurs if we done goofed
+  deleteVector(charArgs);
+  exit(EXIT_FAILURE);
+} 
+
+/*
+ * Closes the pipes!
+ * @param pipefed The array of pipes to be closed
+ */
+void close_pipe(int pipefd [2])
+{
+  if (close(pipefd[0]) == -1)
+    {
+      perror("-1730sh: ");
+      exit(EXIT_FAILURE);
+    }
+  if (close(pipefd[1]) == -1)
+    {
+      perror("-1730sh: ");
+      exit(EXIT_FAILURE);
+    }
+}
+
+/*
+ * Handles exit status printouts after we've waited.
+ * @param pid The PID of the process that was signaled
+ * @param status The status we're checking
+ * @return The exit status we found
+ */
+int exitStatusHandler(int pid, int status)
+{
+  if (WIFEXITED(status)) //Normal exit
+    {
+      lastExitStatus = WEXITSTATUS(status);
+      printf("%d\tExited (%d)\t%s\n", pid, lastExitStatus, jobArg.c_str());
+    }
+  else if (WIFSTOPPED(status)) //Stopped
+    {
+      printf("%d\tStopped\t%s\n", pid, jobArg.c_str());
+    }
+  else if (WIFCONTINUED(status)) //Continued a stop
+    {
+      printf("%d\tContinued\t%s\n", pid, jobArg.c_str());
+    }
+  else if (WIFSIGNALED(status)) //Abnormal exit
+    { 
+      lastExitStatus = WTERMSIG(status);
+      printf("%d\tAbnormal termination (%d)\t%s\n", pid, lastExitStatus, jobArg.c_str());
+    }
+
+  return lastExitStatus;
+}
+
+void printJobs()
+{
+  for (unsigned int i = 0; i < jobsList.size(); i++)
+    {
+      for (unsigned int j = 0; j < jobsList[i].size(); j++)
+	printf("%s\t", jobsList[i].at(j).c_str());
+      printf("\n");
+    }
+}
+
+void jobToForeground(pid_t pgid, bool cont)
+{
+  /* Put the job into the foreground.  */
+  tcsetpgrp(shell_terminal, pgid);
+
+  /* Send the job a continue signal, if necessary.  */
+  if (cont)
+    {
+      if (kill (-pgid, SIGCONT) < 0)
+        perror ("kill (SIGCONT)");
+    }
+
+  /* Wait for it to report.  */
+  jobWaiter(pgid);
+
+  /* Put the shell back in the foreground.  */
+  tcsetpgrp (shell_terminal, shellPG);
+}
+
+void jobToBackground(pid_t pgid, bool cont)
+{
+  /* Send the job a continue signal, if necessary.  */
+  if (cont)
+    if (kill (-pgid, SIGCONT) < 0)
+      perror ("kill (SIGCONT)");
+}
+
+void jobWaiter(pid_t pgid)
+{
+  pid_t wpid;
+  int status;
+  do
+    {
+      wpid = waitpid(WAIT_ANY, &status, 0);
+
+      exitStatusHandler(pgid, status);
+    } while (wpid > 0);
+}

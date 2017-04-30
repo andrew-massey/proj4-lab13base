@@ -1,0 +1,39 @@
+# Lab 13
+
+Joseph Clements (811-830-670)
+
+## Instructions
+
+To remove compiled files in my code, input:
+
+...
+$make clean
+...
+
+To compile all of my code, input:
+
+...
+$ make
+...
+
+To compile my lab individually, input:
+
+...
+$ make lab13
+...
+
+To run my code, compile and then run ./repl.
+Type some stuff in, see the output!
+Handles escape quotes.
+
+...
+$ ./1730sh
+...
+
+## Reflection Stuff
+
+I fixed my memory leak by changing my stuff to vectors and other
+random shenanigans. Lots of stuff to change my shell since lab12.
+I pretty much had to look up everything regarding pipes and what
+not. I used a bit of Mike's example code for pipes and converting
+vectors because it seemed better than reinventing the wheel.

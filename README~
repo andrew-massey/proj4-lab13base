@@ -1,0 +1,38 @@
+# Lab 11
+
+Joseph Clements (811-830-670)
+
+## Instructions
+
+To remove compiled files in my code, input:
+
+...
+$make clean
+...
+
+To compile all of my code, input:
+
+...
+$ make
+...
+
+To compile my lab individually, input:
+
+...
+$ make lab11
+...
+
+To run my code, compile and then input the following, where filename
+is the file to be read by the programs, and args may be -r
+
+...
+$ ./cp -args file1 file2
+...
+
+## Reflection Stuff
+
+My plan was pretty good for this one. It really just took the same
+basic plan I had from rm and moving it over to copy. The biggest
+thing I had difficulty with was copying a directory to a brand new
+directory rather than to an existing directory... but I got it
+figured out in the end!

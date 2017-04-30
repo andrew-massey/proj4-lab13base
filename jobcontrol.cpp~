@@ -1,0 +1,279 @@
+#include "jobcontrol.h"
+
+
+/*
+ * Runs our programs
+ */
+void commandRunner()
+{
+  int pid;
+  pid_t pgid;
+  
+  vector<array<int, 2>> pipes; //Our pipe arrays
+  vector<std::string> job;
+  
+  //CYCLE THROUGH ARGUMENT ARRAYS
+  for (unsigned int i = 0; i < shl_argv.size(); ++i)
+    {
+      if (i != shl_argv.size() - 1) //Not the last command
+        {
+          int pipefd [2]; //Make some pipes
+          if (pipe(pipefd) == -1)
+            {
+              perror("-1730sh: pipe");
+              exit(EXIT_FAILURE);
+            } //if
+          pipes.push_back({pipefd[0], pipefd[1]});
+        } // if
+      
+      //Start FORKING processes
+      if ((pid = fork()) == -1)
+	{
+	  perror("-1730sh: fork");
+	  exit(EXIT_FAILURE);
+	}
+      else if (pid == 0) //In the child process
+	{
+	  //Reset the ignores to default for child
+	  signal(SIGINT, SIG_DFL);
+	  signal(SIGQUIT, SIG_DFL);
+	  signal(SIGTSTP, SIG_DFL);
+	  signal(SIGTTIN, SIG_DFL);
+	  signal(SIGTTOU, SIG_DFL);
+	  signal(SIGCHLD, SIG_DFL);
+	  
+	  pid = getpid();
+	  if (!pgid)
+	    pgid = pid;
+	  setpgid(pid, pgid);
+	  
+	  if (i != 0)
+	    { //Not the first command
+	      if (dup2(pipes.at(i-1)[0], STDIN_FILENO) == -1)
+		{
+		  perror("-1730sh: dup2");
+		  exit(EXIT_FAILURE);
+		}
+	    }
+	  if (i != shl_argv.size() - 1)
+	    { //Not the last command
+	      if (dup2(pipes.at(i)[1], STDOUT_FILENO) == -1)
+		{
+		  perror("-1730sh: dup2");
+		  exit(EXIT_FAILURE);
+		}
+	    }
+	  
+	  //close all pipes created so far
+	  for (unsigned int i = 0; i < pipes.size(); ++i)
+	    close_pipe(pipes.at(i).data());
+	  //Finally, let's make a program!
+	  execProg(shl_argv.at(i));
+	      
+	} // end if-child
+      else
+	{
+	  if (!pgid)
+	    pgid = pid;
+	  setpgid(pid, pgid);
+	}
+    } // end for all commands
+  
+  job.push_back(std::to_string(pgid));
+  job.push_back("Running");
+  job.push_back(jobArg);
+  jobsList.push_back(job);
+  // close all pipes
+  for (unsigned int i = 0; i < pipes.size(); ++i)
+    close_pipe(pipes.at(i).data());
+  
+  if (foregroundJob)
+    jobToForeground(pgid, false);
+  else
+    jobToBackground(pgid, false);
+  
+}
+
+/*
+ * Converts a vector of strings into a vector of characters. Adds nullptr
+ * as the last element of the vector.
+ * @param stringVector The vector of strings to be converted.
+ * @return The new vector of characters.
+ */
+vector<char *> convertVector(vector<std::string> &stringVector)
+{
+  vector<char *> charVector;
+  
+  for (unsigned int i = 0; i < stringVector.size(); ++i)
+    {
+      charVector.push_back(new char [stringVector.at(i).size() + 1]);
+      strcpy(charVector.at(i), stringVector.at(i).c_str());
+    }
+  charVector.push_back(nullptr);
+  
+  return charVector;
+}
+
+/*
+ * Deletes our dynamically allocated character array from conversion.
+ * @param charVector Vector to be deleted.
+ */
+void deleteVector(vector<char *> & charVector)
+{
+  for (unsigned int i = 0; i < charVector.size(); ++i)
+    delete[] charVector.at(i);
+}
+
+/*
+ * Executes the program with an argument list of strings. Sends the
+ * strings to be converted to characters as appropriate first.
+ * @param stringArgs Vector of strings to be passed to program.
+ */
+void execProg(vector<std::string> stringArgs)
+{
+  vector<char *> charArgs = convertVector(stringArgs);
+  execvp(charArgs.at(0), &charArgs.at(0));
+  perror("-1730sh: "); //This only occurs if we done goofed
+  deleteVector(charArgs);
+  exit(EXIT_FAILURE);
+}
+
+/*
+ * Closes the pipes!
+ * @param pipefed The array of pipes to be closed
+ */
+void close_pipe(int pipefd [2])
+{
+  if (close(pipefd[0]) == -1)
+    {
+      perror("-1730sh: ");
+      exit(EXIT_FAILURE);
+    }
+  if (close(pipefd[1]) == -1)
+    {
+      perror("-1730sh: ");
+      exit(EXIT_FAILURE);
+    }
+}
+
+/*
+ * Handles exit status printouts after we've waited.
+ * @param pid The PID of the process that was signaled
+ * @param status The status we're checking
+ * @return The exit status we found
+ */
+int exitStatusHandler(int pid, int status)
+{
+  int job = findJob(pid);
+  
+  if (WIFEXITED(status)) //Normal exit
+    {
+      lastExitStatus = WEXITSTATUS(status);
+      if (job != -1)
+	jobsList.erase(jobsList.begin() + job);
+      printf("%d\tExited (%d)\t%s\n", pid, lastExitStatus, jobArg.c_str());
+    }
+  else if (WIFSTOPPED(status)) //Stopped
+    {
+      if (job != -1)
+	jobsList[job].at(1) = "Stopped";
+      printf("%d\tStopped\t%s\n", pid, jobArg.c_str());
+    }
+  else if (WIFCONTINUED(status)) //Continued a stop
+    {
+      if (job != -1)
+	jobsList[job].at(1) = "Running";
+      printf("%d\tContinued\t%s\n", pid, jobArg.c_str());
+    }
+  else if (WIFSIGNALED(status)) //Abnormal exit
+    {
+      if (job != -1)
+	jobsList.erase(jobsList.begin() + job);
+      lastExitStatus = WTERMSIG(status);
+      printf("%d\tAbnormal termination (%d)\t%s\n", pid, lastExitStatus, jobArg.c_str());
+    }
+  
+  return lastExitStatus;
+}
+
+void printJobs()
+{
+  if (jobsList.size() > 0)
+    printf("JID\tStatus\t\tCommand\n");
+  
+  for (unsigned int i = 0; i < jobsList.size(); i++)
+    {
+      for (unsigned int j = 0; j < jobsList[i].size(); j++)
+	printf("%s\t%s", jobsList[i].at(j).c_str(), ((j==1) ? "\t" : ""));
+      printf("\n");
+    }
+}
+
+void jobToForeground(pid_t pgid, bool cont)
+{
+  /* Put the job into the foreground.  */
+  tcsetpgrp(shell_terminal, pgid);
+  
+  /* Send the job a continue signal, if necessary.  */
+  if (cont)
+    {
+      if (kill (-pgid, SIGCONT) < 0)
+	perror ("kill (SIGCONT)");
+    }
+  
+  /* Wait for it to report.  */
+  jobWaiter(pgid);
+  
+  /* Put the shell back in the foreground.  */
+  tcsetpgrp (shell_terminal, shellPG);
+}
+
+void jobToBackground(pid_t pgid, bool cont)
+{
+  /* Send the job a continue signal, if necessary.  */
+  if (cont)
+    {
+      if (kill (-pgid, SIGCONT) < 0)
+	perror ("kill (SIGCONT)");
+    }
+}
+
+void jobWaiter(pid_t pgid)
+{
+  pid_t wpid;
+  int status;
+  do
+    {
+      wpid = waitpid(-pgid, &status, WUNTRACED);
+      if (WIFSTOPPED(status))
+        {
+          tcsetpgrp(shell_terminal, shellPG);
+          break;
+        }
+    } while (wpid > 0);
+  
+  exitStatusHandler(pgid, status);
+}
+
+void continueJob(pid_t pgid, bool foreground)
+{
+  int job = findJob(pgid);
+  
+  if (job != -1)
+    jobsList[job].at(1) = "Running";
+  
+  if (foreground)
+    jobToForeground (pgid, true);
+  else
+    jobToBackground (pgid, true);
+}
+
+int findJob(pid_t pgid)
+{
+  for (unsigned int i = 0; i < jobsList.size(); i++)
+    {
+      if (atoi(jobsList[i].at(0).c_str()) == pgid)
+	return i;
+    }
+  return -1;
+}
