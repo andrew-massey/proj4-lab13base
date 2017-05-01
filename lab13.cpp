@@ -55,7 +55,9 @@ int shellLoop()
   while (shellStatus >= 0)
     {
       std::string cmd;                //cmd input
-      
+   
+      jobNotification();
+
       //Get current dir and fiddle with it for pretty ~ prompts
       char * rawDirName = get_current_dir_name();
       std::string homePath = getenv("HOME");
@@ -139,6 +141,7 @@ int shellLoop()
 		  commandRunner();
 	    } //Exiting arg size if
 	} //Exiting cmd size if
+
       /*      
       //If everything's cool, print the job parse output
       if (shellStatus >= 0)          
@@ -412,13 +415,18 @@ void commandRunner()
 {
   int pid;
   pid_t pgid;
+  struct job newJob;
 
   vector<array<int, 2>> pipes; //Our pipe arrays
-  vector<std::string> job;
+
+  newJob.command = jobArg;
+  newJob.status = "Running";
 
   //CYCLE THROUGH ARGUMENT ARRAYS
   for (unsigned int i = 0; i < shl_argv.size(); ++i)
-    {
+    {    
+      struct process newProcess;
+
       if (i != shl_argv.size() - 1) //Not the last command
 	{
 	  int pipefd [2]; //Make some pipes
@@ -477,16 +485,19 @@ void commandRunner()
 	} // end if-child
       else
 	{
+	  newProcess.pid = pid;
 	  if (!pgid)
-	    pgid = pid;
+	    {
+	      newJob.pgid = pid;
+	      pgid = pid;
+	    }
 	  setpgid(pid, pgid);
 	}
+      newJob.processes.push_back(newProcess);
     } // end for all commands
-  
-  job.push_back(std::to_string(pgid));
-  job.push_back("Running");
-  job.push_back(jobArg);
-  jobsList.push_back(job);
+
+  vectorJobs.push_back(newJob);
+
   // close all pipes
   for (unsigned int i = 0; i < pipes.size(); ++i)
     close_pipe(pipes.at(i).data());
@@ -496,7 +507,6 @@ void commandRunner()
   else
     jobToBackground(pgid, false);
   
-
 }
 
 /*
@@ -566,7 +576,7 @@ void close_pipe(int pipefd [2])
  * @param pid The PID of the process that was signaled
  * @param status The status we're checking
  * @return The exit status we found
- */
+ *//*
 int exitStatusHandler(int pid, int status)
 {
   int job = findJob(pid);
@@ -599,20 +609,19 @@ int exitStatusHandler(int pid, int status)
     }
   
     return lastExitStatus;
-}
+    }*/
 
 //Print the list of all active jobs
 void printJobs()
 {
-  if (jobsList.size() > 0)
+  if (vectorJobs.size() > 0)
     printf("JID\tStatus\t\tCommand\n");
 
-  for (unsigned int i = 0; i < jobsList.size(); i++)
+  for (unsigned int i = 0; i < vectorJobs.size(); i++)
     {
-      for (unsigned int j = 0; j < jobsList[i].size(); j++)
-	printf("%s\t%s", jobsList[i].at(j).c_str(), ((j==1) ? "\t" : ""));
-      printf("\n");
+      printf("%d\t%s\t\t%s\n", vectorJobs[i].pgid, vectorJobs[i].status.c_str(), vectorJobs[i].command.c_str());
     }
+
 }
 
 //Sends the job to the foreground
@@ -649,17 +658,16 @@ void jobWaiter(pid_t pgid)
 {
   pid_t wpid;
   int status;
+
   do
     {
-      wpid = waitpid(-pgid, &status, WUNTRACED);
-      if (WIFSTOPPED(status))
-	{
-	  tcsetpgrp(shell_terminal, shellPG);
-	  break;
-	}
-    } while (wpid > 0);
+      wpid = waitpid(WAIT_ANY, &status, WUNTRACED);
+    } while (!setProcessStatus(wpid, status) && !isJobComplete(vectorJobs[findJob(pgid)]) && !isJobStopped(vectorJobs[findJob(pgid)]));
+  
+  //  tcsetpgrp(shell_terminal, shellPG);
+   
 
-  exitStatusHandler(pgid, status);
+  //exitStatusHandler(pgid, status);
 }
 
 //Continues the job
@@ -668,8 +676,8 @@ void continueJob(pid_t pgid, bool foreground)
   int job = findJob(pgid);
   
   if (job != -1)
-    jobsList[job].at(1) = "Running";
-
+      vectorJobs[job].status = "Running";
+  
   if (foreground)
     jobToForeground (pgid, true);
   else
@@ -679,11 +687,96 @@ void continueJob(pid_t pgid, bool foreground)
 //Finds the vector with the job in the jobsList
 int findJob(pid_t pgid)
 {
-  for (unsigned int i = 0; i < jobsList.size(); i++)
+  for (unsigned int i = 0; i < vectorJobs.size(); i++)
     {
-      if (atoi(jobsList[i].at(0).c_str()) == pgid)
+      if (vectorJobs[i].pgid == pgid)
 	return i;
     }
   return -1;
 }
- 
+
+int isJobComplete(struct job jobCheck)
+{
+  for (unsigned int i = 0; i < jobCheck.processes.size(); i++)
+    {
+      if (!jobCheck.processes[i].completed)
+	return 0;
+    }
+  return 1;
+}
+
+int isJobStopped(struct job jobCheck)
+{
+  for (unsigned int i = 0; i < jobCheck.processes.size(); i++)
+    {
+      if (jobCheck.processes[i].stopped)
+        return 1;
+    }
+
+  return 0;
+
+}
+
+int setProcessStatus(pid_t pid, int status)
+{
+  if (pid > 0)
+    {
+      for (unsigned int i = 0; i < vectorJobs.size(); i++)
+        for (unsigned int j = 0; j < vectorJobs[i].processes.size(); j++)
+          if (vectorJobs[i].processes[j].pid == pid)
+            {
+              vectorJobs[i].processes[j].status = status;
+              if (WIFSTOPPED (status))
+                vectorJobs[i].processes[j].stopped = true;
+              else
+                {
+                  vectorJobs[i].processes[j].completed = true;
+                  if (WIFSIGNALED (status))
+                    printf("%d terminated by signal (%d)\n", pid,
+			   WTERMSIG (vectorJobs[i].processes[j].status));
+                }
+              return 0;
+	    }
+      printf("No child process %d\n", pid);
+      return -1;
+    }
+  else if (pid == 0 || errno == ECHILD)
+    return -1; //No processes are done
+  else
+    { //Other stuff is broken
+      perror ("waitpid");
+      return -1;
+    }
+}
+
+void updateStatus()
+{
+  int status;
+  pid_t pid;
+  
+  do
+    pid = waitpid (WAIT_ANY, &status, WUNTRACED|WNOHANG);
+  while (!setProcessStatus (pid, status));
+}
+
+
+void jobNotification()
+{
+  updateStatus(); //Update child process stuff
+
+  for (unsigned int i = 0; i < vectorJobs.size(); i++)
+    {
+      if (isJobComplete(vectorJobs[i])) //If everything's done, tell the user and delete it
+	{
+	  printf("%d\t%s\t\t%s\n", vectorJobs[i].pgid, "Exited", vectorJobs[i].command.c_str());
+	  vectorJobs.erase(vectorJobs.begin() + i);
+	  i--;
+	}
+      else if (isJobStopped(vectorJobs[i]) && !vectorJobs[i].notified)
+	{ //If things have stopped, tell the user
+	  printf("%d\t%s\t\t%s\n", vectorJobs[i].pgid, "Stopped", vectorJobs[i].command.c_str());
+	  vectorJobs[i].status = "Stopped";
+	  vectorJobs[i].notified = true;
+	}
+    }
+}

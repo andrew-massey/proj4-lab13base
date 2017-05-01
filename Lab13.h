@@ -25,7 +25,7 @@ pid_t shellPG;
 int shell_terminal;
 bool foregroundJob;
 vector<vector<std::string>> shl_argv;
-vector<vector<std::string>> jobsList;
+//vector<vector<std::string>> jobsList;
 
 std::string shl_stdin;
 std::string shl_stdout;
@@ -48,5 +48,30 @@ void jobToBackground(pid_t pgid, bool cont);
 void jobWaiter(pid_t pgid);
 void continueJob(pid_t pgid, bool foreground);
 int findJob(pid_t pgid);
+
+int isJobComplete(struct job jobCheck);
+int isJobStopped(struct job jobCheck);
+int setProcessStatus(pid_t pid, int status);
+void updateStatus();
+void jobNotification();
+
+struct process
+{
+  pid_t pid;
+  bool completed = false;
+  bool stopped = false;
+  int status;
+};
+
+struct job
+{
+  std::string command;
+  std::string status;
+  vector<process> processes;
+  pid_t pgid;
+  bool notified = false;
+};
+
+vector<job> vectorJobs;
 
 #endif
